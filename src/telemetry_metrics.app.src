@@ -3,9 +3,12 @@
   {vsn, "0.1.0"},
   {registered, []},
   {mod, {telemetry_metrics_app, []}},
-  {applications,
-   [kernel,
-    stdlib
+  {applications, [
+    kernel,
+    stdlib,
+    parse_trans,
+    telemetry,
+    metrics
    ]},
   {env,[]},
   {modules, []},
