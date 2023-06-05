@@ -1,0 +1,13 @@
+/_build
+/.vscode
+/log
+/design/.idea
+/out
+.DS_Store
+.idea
+*.iml
+data1
+.editorconfig
+/erlang_ls.config
+/_checkout
+
