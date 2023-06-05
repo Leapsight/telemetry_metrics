@@ -1,0 +1,11 @@
+{application,telemetry_metrics,
+             [{description,"An OTP application"},
+              {vsn,"0.1.0"},
+              {registered,[]},
+              {mod,{telemetry_metrics_app,[]}},
+              {applications,[kernel,stdlib]},
+              {env,[]},
+              {modules,[telemetry_metrics,telemetry_metrics_app,
+                        telemetry_metrics_sup]},
+              {licenses,["Apache-2.0"]},
+              {links,[]}]}.
