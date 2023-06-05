@@ -110,7 +110,7 @@
 -export([attach/4]).
 -export([attach_many/3]).
 -export([detach/1]).
--export([gen_handler/3]).
+-export([gen_handler/2]).
 
 %% GEN_SERVER API
 -export([init/1]).
@@ -136,9 +136,7 @@
         convert_unit/2,
         parts_per_megabyte/1,
         measurement/3,
-        metadata/2,
-        metric/3,
-        metric_common/3
+        metadata/2
     ]}
 ]).
 -endif.
@@ -416,7 +414,6 @@ attach_many(HandlerId, Mod) ->
 
 
 
-
 %% -----------------------------------------------------------------------------
 %% @private
 %% @doc
@@ -471,15 +468,15 @@ parts_per_megabyte(byte) -> 1000000.
 %% @doc
 %% @end
 %% -----------------------------------------------------------------------------
-measurement(Measurements, _, #{metadata := Fun} = Config)
+measurement(Measurements, _, #{measurement := Fun} = Config)
 when is_function(Fun, 1) ->
     maybe_convert_unit(Fun(Measurements), Config);
 
-measurement(Measurements, Metadata, #{metadata := Fun} = Config)
+measurement(Measurements, Metadata, #{measurement := Fun} = Config)
 when is_function(Fun, 1) ->
     maybe_convert_unit(Fun(Measurements, Metadata), Config);
 
-measurement(Measurements, _, #{metadata := Key} = Config) ->
+measurement(Measurements, _, #{measurement := Key} = Config) ->
     case maps:find(Key, Measurements) of
         {ok, Value} ->
             maybe_convert_unit(Value, Config);
@@ -509,53 +506,11 @@ metadata(Metadata, #{metadata := Fun}) when is_function(Fun, 1) ->
 %% @doc
 %% @end
 %% -----------------------------------------------------------------------------
-metric(Measurements, Metadata, #{type := counter} = Config) ->
-    metrics:counter(metric_common(Measurements, Metadata, Config));
-
-metric(Measurements, Metadata, #{type := gauge} = Config) ->
-    metrics:gauge(metric_common(Measurements, Metadata, Config));
-
-metric(Measurements, Metadata, #{type := histogram} = Config) ->
-    Metric = metric_common(Measurements, Metadata, Config),
-    Buckets =
-        case maps:find(buckets, Config) of
-            {ok, Name} when is_atom(Name) ->
-                persisten_term:get({?MODULE, bucket, Name});
-            {ok, Val} when is_list(Val) ->
-                Val;
-            error ->
-                ?DEFAULT_BUCKETS
-        end,
-
-    metrics:histogram(Metric#{buckets => Buckets}).
-
-
-%% -----------------------------------------------------------------------------
-%% @private
-%% @doc
-%% @end
-%% -----------------------------------------------------------------------------
-metric_common(Measurements, Metadata, Config) ->
-    #{
-        name => maps:get(name, Config),
-        description => maps:get(description, Config, ""),
-        value => measurement(Measurements, Metadata, Config),
-        label => metadata(Metadata, Config)
-    }.
-
-
-%% -----------------------------------------------------------------------------
-%% @private
-%% @doc
-%% @end
-%% -----------------------------------------------------------------------------
 gen_handlers(#{handlers := Handlers}) ->
     try
         lists:foldl(
             fun({HandlerId, HConfig}, Acc) ->
-                HandlerName = handler_name(HandlerId),
-
-                case gen_handler(HandlerId, HandlerName, HConfig) of
+                case gen_handler(HandlerId, HConfig) of
                     {ok, HandlerName} ->
                         [{HandlerId, HandlerName}|Acc];
 
@@ -584,12 +539,13 @@ gen_handlers(_) ->
 %% @doc
 %% @end
 %% -----------------------------------------------------------------------------
-gen_handler(HandlerId, HandlerName, HandlerConfig)
-when is_atom(HandlerName), is_map(HandlerConfig) ->
+gen_handler(HandlerId, HandlerConfig) when is_map(HandlerConfig) ->
+    HandlerName = handler_name(HandlerId),
     Type = maps:get(type, HandlerConfig, callback),
     PoolType = maps:get(pool_type, HandlerConfig, undefined),
     PoolSize = maps:get(pool_size, HandlerConfig, 0),
     EventMetrics = maps:get(event_metrics, HandlerConfig, []),
+    Buckets = maps:get(histogram_buckets, HandlerConfig, #{}),
     EventNames = [EventName || {EventName, _} <- EventMetrics],
 
     %% Purge first
@@ -599,11 +555,13 @@ when is_atom(HandlerName), is_map(HandlerConfig) ->
         {'$var', HandlerName},
         [
             %% API
-            {type, 0},
-            {pool_type, 0},
-            {pool_size, 0},
             {event_names, 0},
             {handle_event, 4},
+            {histogram_buckets, 0},
+            {get_histogram_buckets, 1},
+            {pool_size, 0},
+            {pool_type, 0},
+            {type, 0},
             %% GEN_SERVER CALLBACKS
             {init, 1},
             {handle_call, 3},
@@ -628,15 +586,26 @@ when is_atom(HandlerName), is_map(HandlerConfig) ->
             {event_names,
                 fun() -> {'$var', EventNames} end
             },
+            {histogram_buckets,
+                fun() -> {'$var', Buckets} end
+            },
+            {get_histogram_buckets,
+                fun(Name) ->
+                   maps:get(Name, histogram_buckets(), ?DEFAULT_BUCKETS)
+                end
+            },
             {handle_event,
                 fun(EventName, Measurements, Metadata, Config) ->
                     case {'$var', Type} of
                         callback ->
+                            %% We synchronously call the callback
                             do_handle_event(
                                 EventName, Measurements, Metadata, Config
                             );
 
                         worker_pool ->
+                            %% TODO check pool type and select worker using
+                            %% gproc_pool api
                             gen_server:cast(
                                 {'$var', HandlerName},
                                 {
@@ -704,13 +673,57 @@ when is_atom(HandlerName), is_map(HandlerConfig) ->
                 ]
             },
             %% PRIVATE
-            {convert_unit, fun convert_unit/2},
+            {metric,
+                fun
+                    (Measurements, Metadata, #{type := counter} = Config) ->
+                        metrics:counter(#{
+                            %% description => maps:get(description, Config, ""),
+                            name => maps:get(name, Config),
+                            delta => measurement(
+                                Measurements, Metadata, Config
+                            ),
+                            label => metadata(Metadata, Config)
+                        });
+
+                    (Measurements, Metadata, #{type := gauge} = Config) ->
+                        metrics:gauge(#{
+                            %% description => maps:get(description, Config, ""),
+                            name => maps:get(name, Config),
+                            delta => measurement(
+                                Measurements, Metadata, Config
+                            ),
+                            label => metadata(Metadata, Config)
+                        });
+
+                    (Measurements, Metadata, #{type := histogram} = Config) ->
+                        Buckets =
+                            case maps:find(buckets, Config) of
+                                {ok, Name} when is_atom(Name) ->
+                                    get_histogram_buckets(Name);
+
+                                {ok, Val} when is_list(Val) ->
+                                    Val;
+
+                                error ->
+                                    ?DEFAULT_BUCKETS
+                            end,
+
+                        metrics:histogram(#{
+                            %% description => maps:get(description, Config, ""),
+                            name => maps:get(name, Config),
+                            buckets => Buckets,
+                            value => measurement(
+                                Measurements, Metadata, Config
+                            ),
+                            label => metadata(Metadata, Config)
+                        })
+                end
+            },
             {maybe_convert_unit, fun maybe_convert_unit/2},
+            {convert_unit, fun convert_unit/2},
+            {parts_per_megabyte, fun parts_per_megabyte/1},
             {measurement, fun measurement/3},
-            {metadata, fun metadata/2},
-            {metric, fun metric/3},
-            {metric_common, fun metric_common/3},
-            {parts_per_megabyte, fun parts_per_megabyte/1}
+            {metadata, fun metadata/2}
         ]
     ),
 
