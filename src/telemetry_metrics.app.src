@@ -1,6 +1,6 @@
 {application, telemetry_metrics,
  [{description, "An OTP application"},
-  {vsn, "0.1.1"},
+  {vsn, "0.1.2"},
   {registered, []},
   {mod, {telemetry_metrics_app, []}},
   {applications, [
