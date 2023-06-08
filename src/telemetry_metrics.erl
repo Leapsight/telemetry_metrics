@@ -55,7 +55,7 @@
 
 -define(CONFIG_SPEC, #{
     metadata => #{
-        datatype => map
+        datatype => [map, {function, 0}]
     },
     histogram_buckets => #{
         datatype => map,
