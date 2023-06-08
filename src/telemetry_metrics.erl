@@ -59,7 +59,10 @@
     },
     histogram_buckets => #{
         datatype => map,
-        validator => {map, {term, {list, number}}}
+        validator => {map, {atom, fun
+            (L) when is_list(L) ->
+                lists:all(fun(X) -> is_number(X) end, L)
+        end}}
     },
     handlers => #{
         datatype => list,
@@ -147,7 +150,7 @@
         datatype =>  [atom, {function, 1}, {function, 2}]
     },
     buckets => #{
-        datatype =>  {list, [number]}
+        datatype =>  [atom, {list, [number]}]
     },
     metadata => #{
         datatype => [{list, [atom]}, map, {function, 1}]
@@ -320,7 +323,13 @@ init(_) ->
         Cmd = {init_handlers, Config},
         {ok, #state{}, {continue, Cmd}}
     catch
-        error:Reason ->
+        Class:Reason:Stacktrace ->
+            ?LOG_ERROR(#{
+                description => "Error while parsing application config",
+                class => Class,
+                reason => Reason,
+                stacktrace => Stacktrace
+            }),
             {stop, Reason}
     end.
 
