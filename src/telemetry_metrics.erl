@@ -53,6 +53,110 @@
     )
 ).
 
+-define(CONFIG_SPEC, #{
+    metadata => #{
+        datatype => map
+    },
+    histogram_buckets => #{
+        datatype => map,
+        validator => {map, {term, {list, number}}}
+    },
+    handlers => #{
+        datatype => list,
+        validator => {list, fun
+            Validate({HandlerId, Config}) when is_atom(HandlerId) ->
+                Validate({atom_to_list(HandlerId), Config});
+
+            Validate({HandlerId, Config}) when is_binary(HandlerId) ->
+                Validate({binary_to_list(HandlerId), Config});
+
+            Validate({HandlerId, Config}) when is_list(HandlerId) ->
+                try
+                    Valid = maps_utils:validate(Config, ?HANDLER_SPEC),
+                    {ok, {HandlerId, Valid}}
+                catch
+                    error:Reason ->
+                        {error, Reason}
+                end;
+
+            Validate(_) ->
+                false
+        end}
+    }
+
+}).
+
+
+-define(HANDLER_SPEC, #{
+    event_metrics => #{
+        required => true,
+        default => [],
+        validator => {list, fun
+            ({EventName, Metrics0})
+            when is_list(EventName), is_list(Metrics0) ->
+                try
+                    Metrics = lists:foldl(
+                        fun(Metric0, Acc) ->
+                            [maps_utils:validate(Metric0, ?METRIC_SPEC) | Acc]
+                        end,
+                        [],
+                        Metrics0
+                    ),
+                    {ok, {EventName, Metrics}}
+
+                catch
+                    error:Reason ->
+                        {error, Reason}
+                end;
+
+            (_) ->
+                false
+        end}
+    },
+    config => #{
+        validator => ?HANDLER_CONFIG_SPEC
+    }
+}).
+
+-define(HANDLER_CONFIG_SPEC, #{
+    type => #{
+        required => true,
+        datatype => {in, [callback, worker_pool]},
+        default => callback
+    },
+    pool_size => #{
+        datatype => pos_integer
+    },
+    pool_type => #{
+        datatype => {in, [round_robin, random, hash]}
+    }
+
+}).
+
+-define(METRIC_SPEC, #{
+    type => #{
+        required => true,
+        datatype => {in, [counter, gauge, histogram]}
+    },
+    name => #{
+        required => true,
+        datatype => [atom, binary]
+    },
+    measurement =>#{
+        required => true,
+        datatype =>  [atom, {function, 1}, {function, 2}]
+    },
+    buckets => #{
+        datatype =>  {list, [number]}
+    },
+    metadata => #{
+        datatype => [{list, [atom]}, map, {function, 1}]
+    },
+    description => #{
+        datatype => [binary, list]
+    }
+}).
+
 -record(state, {
     handlers = #{}      ::  #{handler_id() => module()}
 }).
@@ -80,6 +184,7 @@
                                 name := atom() | binary(),
                                 measurement := measurement(),
                                 convert_unit => unit_convertion(),
+                                buckets => [number()],
                                 metadata => metadata(),
                                 description => binary()
                             }.
@@ -209,11 +314,13 @@ detach(HandlerId) ->
 
 
 init(_) ->
+    dbg:tracer(), dbg:p(all,c), dbg:tpl(maps_utils, '_', x),
+
     Config0 = application:get_all_env(?MODULE),
     try
-        {Config, State} = validate_config(Config0, #state{}),
+        Config = validate_config(Config0, #{}),
         Cmd = {init_handlers, Config},
-        {ok, State, {continue, Cmd}}
+        {ok, #state{}, {continue, Cmd}}
     catch
         error:Reason ->
             {stop, Reason}
@@ -241,25 +348,27 @@ handle_continue({init_handlers, Config}, State0) ->
     {noreply, State}.
 
 
-handle_call({attach_many, HandlerId, EventMetrics, HConfig}, _From, State0) ->
-    Config0 = [
-        {handlers, [
-            {HandlerId, [
-                {config, HConfig},
-                {event_metrics, EventMetrics}
-            ]}
-        ]}
-    ],
+handle_call({attach_many, HandlerId, EventMetrics, HConfig}, _From, State) ->
+    Existing = State#state.handlers,
+
+    Config0 = #{
+        handlers => [
+            {HandlerId, #{
+                event_metrics => EventMetrics,
+                config => HConfig
+            }}
+        ]
+    },
 
     try
-        {Config, State} = validate_config(Config0, State0),
+        Config = validate_config(Config0, Existing),
         L = attach_many(Config),
-        Handlers = maps:merge(State#state.handlers, maps:from_list(L)),
+        Handlers = maps:merge(Existing, maps:from_list(L)),
         {reply, ok, State#state{handlers = Handlers}}
 
         catch
             error:Reason ->
-                {reply, {error, Reason}, State0}
+                {reply, {error, Reason}, State}
     end;
 
 handle_call({detach, HandlerId}, _From, State0) ->
@@ -316,67 +425,23 @@ code_change(_OldVsn, State, _Extra) ->
 
 
 %% @private
-validate_config(Term, State) when is_map(Term) ->
-    validate_config(maps:to_list(Term), State);
+validate_config(Config, Existing) when is_list(Config) ->
+    validate_config(maps:from_list(Config), Existing);
 
-validate_config(Term, State) when is_list(Term) ->
-    validate_config(Term, State, #{}).
-
-
-%% @private
-validate_config([{metadata, Term}|T], State, Acc) when is_map(Term) ->
-    validate_config(T, State, maps:put(metadata, Term, Acc));
-
-validate_config([{metadata, Fun}|T], State, Acc) when is_function(Fun, 0) ->
-    validate_config(T, State, maps:put(metadata, Fun(), Acc));
-
-validate_config([{histogram_buckets, Term}|T], State, Acc) ->
-    validate_config(T, State, validate_histogram_buckets(Term, Acc));
-
-validate_config([{handlers, Term}|T], State, Acc) ->
-    Handlers = validate_handlers(Term, State, []),
-    validate_config(T, State, maps:put(handlers, Handlers, Acc));
-
-validate_config([], State, Acc) ->
-    {Acc, State}.
-
-
-%% -----------------------------------------------------------------------------
-%% @private
-%% @doc A collection of named buckets which metrics can reference.
-%% @end
-%% -----------------------------------------------------------------------------
-validate_histogram_buckets(Term, Acc) when is_list(Term) ->
-    validate_histogram_buckets(maps:from_list(Term), Acc);
-
-validate_histogram_buckets(Term, Acc) when is_map(Term) ->
-    ok = maps:foreach(
-        fun(_, V) ->
-            lists:all(fun erlang:is_number/1, V)
-                orelse error({badarg, {histogram_buckets, Term}})
+validate_config(#{handlers := _} = Config0, Existing) when is_map(Config0) ->
+    Config = maps_utils:validate(Config0, ?CONFIG_SPEC),
+    Ids = [Id || {Id, _} <- maps:get(handlers, Config, [])],
+    lists:foreach(
+        fun(Id) ->
+            maps:is_key(Id, Existing) andalso throw({already_exists, Id}),
+            ok
         end,
-        Term
+        Ids
     ),
-    maps:put(histogram_buckets, Term, Acc).
+    Config;
 
-
-%% @private
-validate_handlers([{HandlerId, _}|_], #state{handlers = Handlers}, _)
-when is_map_key(HandlerId, Handlers) ->
-    throw({already_exists, HandlerId});
-
-validate_handlers([H|T], #state{} = State, Acc) ->
-    validate_handlers(T, State, validate_handler(H, Acc));
-
-validate_handlers([], _, Acc) ->
-    Acc.
-
-
-%% @private
-validate_handler({HandlerId, Config}, Acc)
-when is_atom(HandlerId); is_list(HandlerId); is_binary(HandlerId) ->
-    %% TODO
-    [{HandlerId, maps:from_list(Config)} | Acc].
+validate_config(_, _) ->
+    maps:new().
 
 
 %% @private
