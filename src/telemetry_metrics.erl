@@ -314,8 +314,6 @@ detach(HandlerId) ->
 
 
 init(_) ->
-    dbg:tracer(), dbg:p(all,c), dbg:tpl(maps_utils, '_', x),
-
     Config0 = application:get_all_env(?MODULE),
     try
         Config = validate_config(Config0, #{}),
